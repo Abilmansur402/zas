@@ -1,177 +1,132 @@
 """
 clean_vocab.py
 ==============
-wiki.kk.vec ішінен тек анық жалғаулы формаларды алып тастайды.
-Логика: егер сөзді кескенде НӘТИЖЕ де сөздікте бар болса — жалғаулы форма.
-Егер нәтиже сөздікте жоқ болса — бастапқы форма, қалдырамыз.
+wiki.kk.vec ішінен жалғаулы формаларды (жылқыны, жылқының, жылқылары, ...) және
+қазақша емес токендерді («жылқы»», abc, 123) алып тастайды.
 
-Іске қосу:
-    cd ~/Downloads/zhasyrynsoz
-    python3 scripts/clean_vocab.py
+Логика: сөздің соңынан жалғау кесіледі, егер
+  1) қалған түбір сөздікте бар болса,
+  2) түбір мен форма векторлары жеткілікті жақын болса (білім ≠ біл).
+Слова дня (backend/words.py) әрқашан түбір деп саналады (жезде ≠ жез + -де).
+Кесу қайталанады: жылқыларының → жылқылары → жылқы.
+Тек түбір формалар қалады, 2 әріпті сөздер де (су, ат, үй).
 
-Нәтиже:
-    data/wiki.kk.clean.vec
+Іске қосу (жоба түбірінен):
+    python3 scripts/clean_vocab.py          # data/wiki.kk.vec → data/wiki.kk.clean.vec
+    python3 scripts/clean_vocab.py check    # слова дня бар ма?
 """
 
+import re
+import sys
 from pathlib import Path
+
+import numpy as np
 
 VECTORS_PATH = Path("data/wiki.kk.vec")
 OUTPUT_VEC   = Path("data/wiki.kk.clean.vec")
 
-# ── Жалғаулар тізімі (ұзыннан қысқаға) ──────────────────────
-# Тек анық, нақты жалғаулар — қысқа жалғауларды қоспаймыз
-# себебі олар түбірдің өзіне кіруі мүмкін
+# morph.py lives in backend/ locally and next to this script in the Docker build.
+sys.path[:0] = [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parent.parent / "backend")]
+from morph import SHORT_SUFFIXES, stems  # noqa: E402
 
-SUFFIXES = sorted([
-    # Көптік
-    "лардың", "лердің", "дардың", "дердің", "тардың", "тердің",
-    "ларды",  "лерді",  "дарды",  "дерді",  "тарды",  "терді",
-    "ларда",  "лерде",  "дарда",  "дерде",  "тарда",  "терде",
-    "лардан", "лерден", "дардан", "дерден", "тардан", "терден",
-    "ларға",  "лерге",  "дарға",  "дерге",  "тарға",  "терге",
-    "лармен", "лермен", "дармен", "дермен", "тармен", "термен",
-    "лары",   "лері",
-    "лар",    "лер",    "дар",    "дер",    "тар",    "тер",
+try:
+    from words import DAILY_WORDS  # noqa: E402
+except ImportError:
+    DAILY_WORDS = []
 
-    # Септік (тек ұзын формалар — қысқаларды векторда тексереміз)
-    "дікі",  "тікі",  "нікі",
-    "дағы",  "дегі",  "тағы",  "тегі",
-], key=len, reverse=True)
+# Curated daily words are known roots: never stripped (жезде ≠ жез + -де), and
+# forms of them need less vector similarity to be folded in (атты → ат).
+KNOWN_ROOTS = set(DAILY_WORDS)
+MIN_COSINE = 0.4
+MIN_COSINE_KNOWN_ROOT = 0.3
+MIN_COSINE_SHORT = 0.5      # for one-letter endings: сиыры → сиыр, but жылы ≠ жыл
+KAZAKH_WORD = re.compile(r"^[а-яәіңғүұқөһё]+(?:-[а-яәіңғүұқөһё]+)?$")
 
-MIN_STEM = 3
 
-def is_kazakh(word):
-    bad = set("abcdefghijklmnopqrstuvwxyz0123456789@#$%^&*()[]{}|\\/<>")
-    return not any(c in bad for c in word.lower()) and len(word) >= MIN_STEM
+def is_kazakh(word: str) -> bool:
+    return len(word) >= 2 and bool(KAZAKH_WORD.match(word))
 
-def load_vocab_set(path):
-    """Тек сөздер жиынын жүктеу (векторсыз) — жылдам тексеру үшін."""
-    print("📖 Сөздік жүктелуде (1-рет)...")
-    vocab = set()
-    with open(path, "r", encoding="utf-8") as f:
-        f.readline()
+
+def load_vectors(path: Path):
+    print(f"Loading {path} ...")
+    words, vecs, seen = [], [], set()
+    with open(path, encoding="utf-8") as f:
+        dim = int(f.readline().split()[1])
         for line in f:
-            word = line.split(" ", 1)[0]
-            vocab.add(word)
-    print(f"   {len(vocab):,} сөз жүктелді.")
-    return vocab
+            parts = line.rstrip().split(" ")
+            if len(parts) != dim + 1:
+                continue
+            w = parts[0].lower()
+            if w in seen or not is_kazakh(w):
+                continue
+            try:
+                vecs.append(np.asarray(parts[1:], dtype=np.float32))
+            except ValueError:
+                continue
+            words.append(w)
+            seen.add(w)
+    m = np.vstack(vecs)
+    m /= np.maximum(np.linalg.norm(m, axis=1, keepdims=True), 1e-9)
+    print(f"  {len(words):,} Kazakh tokens (dim={dim})")
+    return words, m, dim
 
-def get_stem(word, vocab):
-    """
-    Жалғауды кес — бірақ тек нәтиже сөздікте болса.
-    Егер нәтиже сөздікте жоқ болса — сөз өзі түбір.
-    """
-    w = word.lower()
-    for suffix in SUFFIXES:
-        if w.endswith(suffix):
-            stem = w[:-len(suffix)]
-            if len(stem) >= MIN_STEM and stem in vocab:
-                return stem  # жалғаулы форма, кестік
-    return w  # түбір форма, қалдырамыз
+
+def find_root(word: str, idx: dict, m: np.ndarray, cache: dict) -> str:
+    """Strips suffixes while the stem is a word with a similar vector."""
+    if word in cache:
+        return cache[word]
+    root = word
+    i = idx[word]
+    candidates = [] if word in KNOWN_ROOTS else [
+        *((s, False) for s in stems(word)),
+        *((s, True) for s in stems(word, SHORT_SUFFIXES) if len(s) >= 3),
+    ]
+    for stem, short in candidates:
+        j = idx.get(stem)
+        if j is None:
+            continue
+        need = MIN_COSINE_SHORT if short else MIN_COSINE_KNOWN_ROOT if stem in KNOWN_ROOTS else MIN_COSINE
+        if float(m[i] @ m[j]) < need:
+            continue
+        root = find_root(stem, idx, m, cache)
+        break
+    cache[word] = root
+    return root
+
 
 def clean_vectors():
     if not VECTORS_PATH.exists():
-        print(f"❌ {VECTORS_PATH} табылмады!")
-        return
+        sys.exit(f"{VECTORS_PATH} not found. Run scripts/download_vectors.sh first.")
+    words, m, dim = load_vectors(VECTORS_PATH)
+    idx = {w: i for i, w in enumerate(words)}
+    cache: dict[str, str] = {}
+    keep = [i for i, w in enumerate(words) if find_root(w, idx, m, cache) == w]
+    print(f"  {len(keep):,} root forms kept, {len(words) - len(keep):,} inflected forms dropped")
 
-    # 1. Сөздікті жиын ретінде жүктеу
-    vocab_set = load_vocab_set(VECTORS_PATH)
-
-    print(f"\n🧹 Тазалануда...")
-
-    seen_stems = {}   # stem → vector_line
-    total = kept = skipped = 0
-
-    with open(VECTORS_PATH, "r", encoding="utf-8") as f:
-        header = f.readline().strip()
-        _, dim = header.split()
-
-        for line in f:
-            total += 1
-            if total % 50000 == 0:
-                print(f"   {total:,} өңделді, {kept:,} сақталды...")
-
-            parts = line.rstrip().split(" ")
-            if len(parts) < 5:
-                continue
-
-            word = parts[0]
-
-            # Тек қазақша сөздер
-            if not is_kazakh(word):
-                skipped += 1
-                continue
-
-            # Түбірін тап
-            stem = get_stem(word, vocab_set)
-
-            # Бірінші кездескен немесе нақты түбір форма артық
-            if stem not in seen_stems:
-                seen_stems[stem] = line
-                kept += 1
-            else:
-                # Егер бұл сөздің өзі = stem болса, векторын алмастыр
-                if word.lower() == stem:
-                    seen_stems[stem] = line
-
-    print(f"\n✅ Нәтиже:")
-    print(f"   Барлық сөз:    {total:,}")
-    print(f"   Қазақ емес:    {skipped:,}")
-    print(f"   Таза сөздер:   {kept:,}")
-
-    # Жазу
-    print(f"\n💾 {OUTPUT_VEC} жазылуда...")
-    OUTPUT_VEC.parent.mkdir(exist_ok=True)
-
+    # Raw (un-normalised) values are not needed: the engine normalises anyway.
     with open(OUTPUT_VEC, "w", encoding="utf-8") as f:
-        f.write(f"{kept} {dim}\n")
-        for stem, line in seen_stems.items():
-            # Бастапқы сөзді stem-ге алмастырып жазамыз
-            parts = line.rstrip().split(" ")
-            parts[0] = stem
-            f.write(" ".join(parts) + "\n")
-
-    print(f"✅ {OUTPUT_VEC} дайын!\n")
-    print(f"📌 Келесі қадам — embeddings.py ішінде:")
-    print(f"   VECTORS_PATH = './data/wiki.kk.clean.vec'")
+        f.write(f"{len(keep)} {dim}\n")
+        for i in keep:
+            f.write(words[i] + " " + " ".join(f"{x:.5f}" for x in m[i]) + "\n")
+    print(f"Wrote {OUTPUT_VEC}")
 
 
 def check_words():
-    """words.py тізімін тексеру."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-    from words import DAILY_WORDS
-
-    if not VECTORS_PATH.exists():
-        print("❌ wiki.kk.vec жоқ, check мүмкін емес")
+    if not DAILY_WORDS:
+        print("words.py not found, skipping the daily word check.")
         return
-
-    vocab_set = load_vocab_set(VECTORS_PATH)
-
-    print(f"\n🔍 words.py тексерілуде ({len(DAILY_WORDS)} сөз)...")
-
-    ok = []
-    missing = []
-
-    for word in DAILY_WORDS:
-        if word in vocab_set:
-            ok.append(word)
-        else:
-            missing.append(word)
-
-    print(f"✅ Сөздікте бар:  {len(ok)}")
+    vocab = set()
+    with open(OUTPUT_VEC, encoding="utf-8") as f:
+        f.readline()
+        for line in f:
+            vocab.add(line.split(" ", 1)[0])
+    missing = [w for w in DAILY_WORDS if w not in vocab]
+    print(f"Daily words in vocabulary: {len(DAILY_WORDS) - len(missing)}/{len(DAILY_WORDS)}")
     if missing:
-        print(f"⚠️  Сөздікте жоқ: {len(missing)}")
-        for w in missing:
-            print(f"   - {w}")
-    else:
-        print("🎉 Барлық сөз сөздікте бар!")
+        print("Missing:", ", ".join(missing))
 
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "check":
-        check_words()
-    else:
+    if len(sys.argv) < 2 or sys.argv[1] != "check":
         clean_vectors()
-        check_words()
+    check_words()

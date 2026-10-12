@@ -1,73 +1,203 @@
 from dotenv import load_dotenv
+
 load_dotenv()
 
-import os
-import math
+import base64
+import hashlib
+import hmac
 import logging
+import math
+import os
 import random
-import uuid
-from datetime import date, timezone, datetime
+import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
 from embeddings import engine
-from words import get_daily_word, DAILY_WORDS
+from hints import get_category_hint
+from morph import find_known_root
+from words import DAILY_WORDS, EPOCH
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-custom_games: dict[str, str] = {}
+# ── Settings ───────────────────────────────────────────────────
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
+    if o.strip()
+]
+# The daily word changes at local midnight. Kazakhstan is UTC+5.
+DAY_TZ = timezone(timedelta(hours=float(os.getenv("DAY_UTC_OFFSET_HOURS", "5"))))
+SECRET_KEY = os.getenv("SECRET_KEY", "")
+if not SECRET_KEY:
+    SECRET_KEY = "dev-insecure-key"
+    logger.warning("SECRET_KEY is not set; custom-game links use an insecure dev key.")
+
+# Per-client request budget for /api/* (simple in-memory sliding window).
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))
+
+# Secret words that actually exist in the loaded vocabulary (filled at startup).
+playable_words: list[str] = []
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Loading Kazakh word vectors…")
     await engine.load()
-    logger.info("Embedding engine ready. Vocab size: %d", len(engine.words))
+    playable_words[:] = [w for w in DAILY_WORDS if engine.word_exists(w)]
+    missing = [w for w in DAILY_WORDS if not engine.word_exists(w)]
+    if missing:
+        logger.warning("%d daily words are not in the vocabulary and are skipped: %s",
+                       len(missing), ", ".join(missing[:50]))
+    if not playable_words:
+        raise RuntimeError("No daily word exists in the loaded vocabulary.")
+    logger.info("Engine ready. Vocab: %d, playable daily words: %d",
+                len(engine.words), len(playable_words))
     yield
-    logger.info("Shutting down.")
 
-app = FastAPI(title="Жасырын Сөз API", version="2.0.0", lifespan=lifespan)
 
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://localhost:5173"
-).split(",")
+app = FastAPI(title="Жасырын Сөз API", version="2.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
-EPOCH = date(2024, 1, 1)
+
+class RateLimiter:
+    def __init__(self, limit: int, window: float = 60.0):
+        self.limit = limit
+        self.window = window
+        self._hits: dict[str, deque] = defaultdict(deque)
+
+    def allow(self, key: str) -> bool:
+        if self.limit <= 0:
+            return True
+        now = time.monotonic()
+        hits = self._hits[key]
+        while hits and now - hits[0] > self.window:
+            hits.popleft()
+        if len(hits) >= self.limit:
+            return False
+        hits.append(now)
+        if len(self._hits) > 10_000:  # drop idle clients so memory stays bounded
+            for k in [k for k, v in self._hits.items() if not v or now - v[-1] > self.window]:
+                del self._hits[k]
+        return True
+
+
+rate_limiter = RateLimiter(RATE_LIMIT_PER_MIN)
+
+
+def client_ip(request: Request) -> str:
+    # Hugging Face / nginx put the real client first in X-Forwarded-For.
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    if request.url.path.startswith("/api/") and not rate_limiter.allow(client_ip(request)):
+        return JSONResponse(status_code=429, content={"detail": {
+            "code": "RATE_LIMITED", "message": "Тым көп сұраныс. Біраз күтіңіз."}})
+    return await call_next(request)
+
+
+# ── Game helpers ───────────────────────────────────────────────
+def today_local():
+    return datetime.now(DAY_TZ).date()
+
 
 def get_game_id_for_today() -> int:
-    today = datetime.now(timezone.utc).date()
-    return (today - EPOCH).days
+    return (today_local() - EPOCH).days
+
 
 def game_id_to_word(game_id: int) -> str:
-    return get_daily_word(game_id)
+    return playable_words[game_id % len(playable_words)]
+
 
 def rank_to_color(rank: int) -> str:
-    if rank == 1: return "winner"
-    if rank < 100: return "hot"
-    if rank < 1000: return "warm"
+    if rank == 1:
+        return "winner"
+    if rank < 100:
+        return "hot"
+    if rank < 1000:
+        return "warm"
     return "cold"
 
+
 def rank_to_closeness_pct(rank: int, vocab_size: int) -> float:
-    if rank == 1: return 100.0
+    if rank == 1:
+        return 100.0
     log_rank = math.log10(max(rank, 1))
     log_max = math.log10(max(vocab_size, 2))
     return round(max(0.0, (1 - log_rank / log_max) * 100), 1)
 
 
+# Custom games are stateless: the token carries the word's vocab index plus an
+# HMAC signature, so links survive restarts and work across several workers.
+def _sign(idx: int, word: str) -> str:
+    mac = hmac.new(SECRET_KEY.encode(), f"{idx}:{word}".encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac[:9]).decode().rstrip("=")
+
+
+def make_custom_token(word: str) -> str:
+    idx = engine.word_to_idx[word]
+    return f"{idx:x}.{_sign(idx, word)}"
+
+
+def resolve_custom_token(token: str) -> str:
+    try:
+        idx_hex, sig = token.split(".", 1)
+        idx = int(idx_hex, 16)
+        word = engine.words[idx]
+    except (ValueError, IndexError):
+        raise HTTPException(404, detail="Custom game not found.")
+    if not hmac.compare_digest(sig, _sign(idx, word)):
+        raise HTTPException(404, detail="Custom game not found.")
+    return word
+
+
+def resolve_secret(game_id: Optional[int], custom_token: Optional[str]) -> str:
+    if custom_token:
+        return resolve_custom_token(custom_token)
+    if game_id is not None:
+        if game_id < 0:
+            raise HTTPException(422, detail="Invalid game_id.")
+        return game_id_to_word(game_id)
+    raise HTTPException(422, detail="Provide game_id or custom_token.")
+
+
+def require_engine():
+    if not engine.is_loaded() or not playable_words:
+        raise HTTPException(503, detail="Engine not ready.")
+
+
+def normalize_word(v: str) -> str:
+    return " ".join(v.strip().lower().split())
+
+
+def to_vocab_word(word: str) -> Optional[str]:
+    """The word itself if known, else its root («жылқыны» → «жылқы»), else None."""
+    if engine.word_exists(word):
+        return word
+    return find_known_root(word, engine.word_exists)
+
+
+# ── Schemas ────────────────────────────────────────────────────
 class GuessRequest(BaseModel):
     game_id: Optional[int] = None
     custom_token: Optional[str] = None
@@ -76,10 +206,13 @@ class GuessRequest(BaseModel):
     @field_validator("guess")
     @classmethod
     def clean_guess(cls, v: str) -> str:
-        cleaned = v.strip().lower()
-        if not cleaned: raise ValueError("Guess cannot be empty")
-        if len(cleaned) > 60: raise ValueError("Guess too long")
+        cleaned = normalize_word(v)
+        if not cleaned:
+            raise ValueError("Guess cannot be empty")
+        if len(cleaned) > 60:
+            raise ValueError("Guess too long")
         return cleaned
+
 
 class GuessResponse(BaseModel):
     rank: int
@@ -88,15 +221,18 @@ class GuessResponse(BaseModel):
     found: bool
     guess: str
 
+
 class DailyResponse(BaseModel):
     game_id: int
     total_words: int
     date: str
 
+
 class HintResponse(BaseModel):
     game_id: Optional[int]
     hint_type: str
     hint: str
+
 
 class CustomGameRequest(BaseModel):
     word: str
@@ -104,73 +240,73 @@ class CustomGameRequest(BaseModel):
     @field_validator("word")
     @classmethod
     def clean(cls, v: str) -> str:
-        w = v.strip().lower()
-        if not w: raise ValueError("Empty word")
-        if len(w) > 40: raise ValueError("Too long")
+        w = normalize_word(v)
+        if not w:
+            raise ValueError("Empty word")
+        if len(w) > 40:
+            raise ValueError("Too long")
         return w
+
 
 class CustomGameResponse(BaseModel):
     custom_token: str
 
 
+HintType = Literal["category", "letter", "length", "far_word", "mid_word", "close_word"]
+
+
+# ── Endpoints ──────────────────────────────────────────────────
 @app.get("/")
-async def root():
-    return {"status": "ok", "vocab_loaded": engine.is_loaded(), "vocab_size": len(engine.words)}
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "vocab_loaded": engine.is_loaded(),
+        "vocab_size": len(engine.words),
+        "daily_words": len(playable_words),
+        "dummy_vectors": engine.is_dummy,
+    }
 
 
 @app.get("/api/daily", response_model=DailyResponse)
 async def get_daily():
-    game_id = get_game_id_for_today()
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return DailyResponse(game_id=game_id, total_words=len(DAILY_WORDS), date=today_str)
+    require_engine()
+    return DailyResponse(
+        game_id=get_game_id_for_today(),
+        total_words=len(playable_words),
+        date=today_local().isoformat(),
+    )
 
 
 @app.get("/api/random")
 async def get_random_game():
-    game_id = random.randint(0, len(DAILY_WORDS) - 1)
-    return {"game_id": game_id, "total_words": len(DAILY_WORDS)}
+    require_engine()
+    return {"game_id": random.randrange(len(playable_words)), "total_words": len(playable_words)}
 
 
 @app.post("/api/custom", response_model=CustomGameResponse)
 async def create_custom_game(body: CustomGameRequest):
-    if not engine.is_loaded():
-        raise HTTPException(503, detail="Engine not ready.")
-    if not engine.word_exists(body.word):
-        raise HTTPException(422, detail={"code": "WORD_NOT_FOUND", "message": f"«{body.word}» сөздікте жоқ."})
-    token = str(uuid.uuid4())[:8]
-    custom_games[token] = body.word
-    return CustomGameResponse(custom_token=token)
+    require_engine()
+    word = to_vocab_word(body.word)
+    if word is None:
+        raise HTTPException(422, detail={"code": "WORD_NOT_FOUND",
+                                         "message": f"«{body.word}» сөздікте жоқ."})
+    return CustomGameResponse(custom_token=make_custom_token(word))
 
 
 @app.post("/api/guess", response_model=GuessResponse)
 async def submit_guess(body: GuessRequest):
-    if not engine.is_loaded():
-        raise HTTPException(503, detail="Word vectors not yet loaded.")
-
-    if body.custom_token:
-        secret = custom_games.get(body.custom_token)
-        if not secret:
-            raise HTTPException(404, detail="Custom game not found.")
-    elif body.game_id is not None:
-        secret = game_id_to_word(body.game_id)
-    else:
-        raise HTTPException(422, detail="Provide game_id or custom_token.")
-
-    guess = body.guess
+    require_engine()
+    secret = resolve_secret(body.game_id, body.custom_token)
+    # Inflected guesses count as their root, which is what the response shows.
+    guess = body.guess if body.guess == secret else to_vocab_word(body.guess)
+    if guess is None:
+        raise HTTPException(422, detail={"code": "WORD_NOT_FOUND",
+                                         "message": f"Сөз табылмады: «{body.guess}»."})
 
     if guess == secret:
         return GuessResponse(rank=1, color="winner", closeness_pct=100.0, found=True, guess=guess)
 
-    if not engine.word_exists(secret):
-        raise HTTPException(500, detail="Secret word not in vocabulary.")
-
-    if not engine.word_exists(guess):
-        raise HTTPException(422, detail={"code": "WORD_NOT_FOUND", "message": f"Сөз табылмады: «{guess}»."})
-
-    # Тек DAILY_WORDS ішіндегі сөздер арасындағы rank
-    _daily_set = set(w.lower() for w in DAILY_WORDS)
-    if guess.lower() not in _daily_set and guess.lower() != secret.lower():
-        raise HTTPException(status_code=404, detail="Сөз тізімде жоқ")
     rank = engine.get_rank(secret, guess)
     if rank is None:
         raise HTTPException(500, detail="Could not compute rank.")
@@ -178,19 +314,10 @@ async def submit_guess(body: GuessRequest):
     return GuessResponse(
         rank=rank,
         color=rank_to_color(rank),
-        closeness_pct=rank_to_closeness_pct(rank, len(DAILY_WORDS)),
+        closeness_pct=rank_to_closeness_pct(rank, len(engine.words)),
         found=False,
         guess=guess,
     )
-
-
-def _resolve_secret(game_id, custom_token):
-    if custom_token:
-        secret = custom_games.get(custom_token)
-        if not secret:
-            raise HTTPException(404, detail="Custom game not found.")
-        return secret
-    return game_id_to_word(game_id)
 
 
 def _neighbor_word(neighbors, start, end):
@@ -198,274 +325,84 @@ def _neighbor_word(neighbors, start, end):
     return pool[0] if pool else "?"
 
 
+def build_hint(secret: str, hint_type: str, offset: int = 0) -> str:
+    if hint_type == "letter":
+        return f"Сөздің бірінші әрпі: «{secret[0].upper()}»"
+    if hint_type == "length":
+        return f"Сөздің ұзындығы: {len(secret)} әріп"
+    if hint_type == "category":
+        return get_category_hint(secret)
+
+    neighbors = engine.get_top_similar(secret, topn=300)
+    if hint_type == "far_word":
+        return f"Алыс маңайдағы сөз (~200–300 орын): «{_neighbor_word(neighbors, 199, 300)}»"
+    if hint_type == "mid_word":
+        return f"Жақынырақ сөз (~50–80 орын): «{_neighbor_word(neighbors, 49, 80)}»"
+    # close_word: each call (offset 0..9) reveals a different word from the top ~120
+    start = 19 + offset * 10
+    end = start + 10
+    return f"Жақын сөз (~{start}–{end} орын): «{_neighbor_word(neighbors, start, end)}»"
+
+
 @app.get("/api/hint/{game_id}", response_model=HintResponse)
-async def get_hint(game_id: int, hint_type: str = "category", offset: int = 0):
-    if not engine.is_loaded():
-        raise HTTPException(503, detail="Engine not ready.")
-    secret = game_id_to_word(game_id)
-    hint = _build_hint(secret, hint_type, offset)
-    return HintResponse(game_id=game_id, hint_type=hint_type, hint=hint)
+async def get_hint(game_id: int, hint_type: HintType = "category",
+                   offset: int = Query(0, ge=0, le=9)):
+    require_engine()
+    secret = resolve_secret(game_id, None)
+    return HintResponse(game_id=game_id, hint_type=hint_type, hint=build_hint(secret, hint_type, offset))
 
 
 @app.get("/api/hint/custom/{custom_token}", response_model=HintResponse)
-async def get_custom_hint(custom_token: str, hint_type: str = "category", offset: int = 0):
-    if not engine.is_loaded():
-        raise HTTPException(503, detail="Engine not ready.")
-    secret = custom_games.get(custom_token)
-    if not secret:
-        raise HTTPException(404, detail="Custom game not found.")
-    hint = _build_hint(secret, hint_type, offset)
-    return HintResponse(game_id=None, hint_type=hint_type, hint=hint)
+async def get_custom_hint(custom_token: str, hint_type: HintType = "category",
+                          offset: int = Query(0, ge=0, le=9)):
+    require_engine()
+    secret = resolve_custom_token(custom_token)
+    return HintResponse(game_id=None, hint_type=hint_type, hint=build_hint(secret, hint_type, offset))
 
 
-def _build_hint(secret: str, hint_type: str, offset: int = 0) -> str:
-    if hint_type == "letter":
-        return f"Сөздің бірінші әрпі: «{secret[0].upper()}»"
-
-    if hint_type == "length":
-        return f"Сөздің ұзындығы: {len(secret)} әріп"
-
-    if hint_type == "category":
-        return _get_category_hint(secret)
-
-    if not engine.word_exists(secret):
-        raise HTTPException(500, detail="Secret word not in vocabulary.")
-
-    from words import DAILY_WORDS as _dw
-    _daily_set = set(w.lower() for w in _dw)
-    _all = engine.get_top_similar(secret, topn=len(engine.words))
-    neighbors = [(w, s) for w, s in _all if w.lower() in _daily_set][:700]
-
-    if hint_type == "far_word":
-        word = _neighbor_word(neighbors, 199, 300)
-        return f"Алыс маңайдағы сөз (~200–300 орын): «{word}»"
-
-    if hint_type == "mid_word":
-        word = _neighbor_word(neighbors, 49, 80)
-        return f"Жақынырақ сөз (~50–80 орын): «{word}»"
-
-    if hint_type == "close_word":
-        start = 19 + (offset * 10)
-        end = start + 10
-        word = _neighbor_word(neighbors, start, end)
-        return f"Жақын сөз (~{start}–{end} орын): «{word}»"
-
-    return _get_category_hint(secret)
-
-
-_CATEGORIES: list[tuple[set, str]] = [
-    # ── Табиғат & География ──────────────────────────────────────
-    ({"су","жер","күн","ай","жұлдыз","тау","дала","орман","теңіз","өзен","көл",
-      "қар","жел","бұлт","жаңбыр","найзағай","нұр","жарық","от","жалын","мұз",
-      "боран","дауыл","шық","тұман","самал","леп","аяз","қырау","кемпірқосақ",
-      "жайлау","алқап","бұлақ","шатқал","жота","шың","тоған","жазира","тоғай",
-      "қамыс","шалғын","жыра","аңғар","жар","үңгір","дөң","төбе","қыр",
-      "жазық","ойпаң","белес","өткел","саға","арна","сел"},
-     "Бұл сөз табиғатқа немесе географияға қатысты."),
-
-    # ── Ауа райы ─────────────────────────────────────────────────
-    ({"жел","қар","жаңбыр","бұлт","тұман","нөсер","боран","дауыл","жасын",
-      "найзағай","мұз","шық","самал","леп","аяз","қырау","кемпірқосақ",
-      "долы","ыстық","суық","жылу","нұр","жарық","бу","түтін"},
-     "Бұл ауа райы немесе табиғат құбылысына қатысты."),
-
-    # ── Өсімдіктер & Жемістер ────────────────────────────────────
-    ({"шөп","гүл","терек","бұтақ","тамыр","жапырақ","жеміс","дән","тікен","мүк",
-      "қайың","емен","шырша","арша","қарағай","тал","жусан","бетеге","сексеуіл",
-      "алма","алмұрт","өрік","шабдалы","жүзім","қарбыз","қауын","жидек","бидай",
-      "тары","арпа","күріш","жүгері","картоп","пияз","сәбіз","қырыққабат","қияр",
-      "раушан","лале","нарцисс","қалампыр","долана","тобылғы","мойыл","итмұрын",
-      "томат","сарымсақ","кәді","асқабақ","баклажан","жержаңғақ","соя",
-      "зығыр","мақта","күнбағыс","таңқурай","шие"},
-     "Бұл өсімдік, жеміс немесе дақылға қатысты сөз."),
-
-    # ── Жануарлар & Құстар ───────────────────────────────────────
-    ({"ат","жылқы","түйе","қой","сиыр","ешкі","ит","мысық","қоян","тышқан",
-      "түлкі","қасқыр","аю","бұлан","марал","арыстан","барыс","жолбарыс",
-      "бұғы","қабан","дельфин","кит","піл","зебра","жираф","маймыл",
-      "тиін","кіртышқан","сусар","бұлғын","бобр","бұқа","торай","лақ",
-      "бота","құлын","тайынша",
-      "бүркіт","қыран","лашын","қаз","үйрек","аққу","тырна","дуадақ",
-      "тауық","қораз","үкі","торғай","қарлығаш","кептер","тоқылдақ",
-      "қарға","сауысқан","ителгі","сұңқар","бозторғай",
-      "жылан","бақа","тасбақа","кесіртке","шаян","өрмекші",
-      "құмырсқа","ара","шіркей","қоңыз","көбелек","шегіртке","маса","балық"},
-     "Бұл жануар, хайуан немесе құс."),
-
-    # ── Адам денесі ──────────────────────────────────────────────
-    ({"бас","жүз","маңдай","қас","көз","мұрын","ауыз","ерін","тіс","тіл",
-      "құлақ","мойын","иық","кеуде","арқа","бел","іш","қол","шынтақ",
-      "білек","саусақ","аяқ","тізе","табан","шаш","сақал","мұрт","тырнақ",
-      "жүрек","өкпе","бауыр","бүйрек","қан","сүйек","тері","дене",
-      "омыртқа","бұлшықет","жүйке","тамыр","ми","асқазан","бүйрек үсті"},
-     "Бұл адам денесінің мүшесі немесе дене бөлігі."),
-
-    # ── Үй & Жиһаз ───────────────────────────────────────────────
-    ({"үй","шаңырақ","есік","терезе","төбе","еден","қабырға","бөлме",
-      "балкон","баспалдақ","қора","диірмен","қамал","пәтер","жатақхана",
-      "кеңсе","зал","дәліз","аула","қоршау","дарбаза","қақпа","жертөле",
-      "үстел","орындық","төсек","жастық","жабу","кілем","шам","айна",
-      "сағат","кілт","жәшік","сандық","шелек","табақ","кесе","шыны",
-      "қасық","шанышқы","пышақ","қазан","диван","кресло","шкаф","сөре","гардероб"},
-     "Бұл үй немесе үй мүлкіне қатысты."),
-
-    # ── Тамақ & Ішімдік ──────────────────────────────────────────
-    ({"нан","ет","сорпа","бешбармақ","қазы","шұжық","сүт","айран","қымыз",
-      "шай","кофе","май","тұз","қант","ұн","жұмыртқа","ірімшік","бал",
-      "қаймақ","қуырдақ","манты","самса","борщ","палау","ботқа","тоқаш",
-      "баурсақ","шелпек","жент","шырын","лимонад","морс","компот",
-      "дәмдеуіш","бұрыш","сарымсақ","укроп","петрушка"},
-     "Бұл тамақ немесе ішімдікке қатысты."),
-
-    # ── Киім ─────────────────────────────────────────────────────
-    ({"киім","көйлек","шалбар","жейде","пальто","шапан","бөрік","тымақ",
-      "орамал","шарф","қолғап","белдік","етік","мәсі","тәпішке","туфля",
-      "костюм","галстук","кофта","жилет","пуловер","свитер","жақа","тон"},
-     "Бұл киім немесе киім-кешекке қатысты."),
-
-    # ── Адам & Отбасы ────────────────────────────────────────────
-    ({"ана","әке","бала","қыз","ұл","апа","аға","іні","қарындас","ата","әже",
-      "немере","туыс","жесір","жар","күйеу","келін","дос","жау","көрші",
-      "қонақ","жолаушы","батыр","хан","бек","би","адам","халық","отбасы",
-      "нағашы","жиен","бөле","балдыз","қайнаға","жезде","ұрпақ","буын"},
-     "Бұл адам немесе туыстық қарым-қатынасқа қатысты."),
-
-    # ── Сезім & Рух ──────────────────────────────────────────────
-    ({"жан","рух","сезім","ой","ақыл","арман","үміт","қайғы","қуаныш",
-      "күлкі","жылау","ашу","қорқыныш","сенім","махаббат","сүйіспеншілік",
-      "өкініш","рақым","мейір","намыс","ар","ұят","берекет","реніш",
-      "ынта","ерік","талап","тілек","зейін","жады","қиял","шабыт","жігер",
-      "бақыт","шындық","өтірік","жақсылық","жамандық","тағдыр"},
-     "Бұл сезім, ой немесе рухани ұғым."),
-
-    # ── Уақыт & Мезгіл ───────────────────────────────────────────
-    ({"уақыт","жыл","ай","апта","күн","сағат","минут","секунд","таң","түс",
-      "кеш","түн","бүгін","ертең","кеше","жаз","күз","қыс","көктем",
-      "болашақ","өткен","мерзім","кезең","ғасыр","дәуір","заман","тоқсан"},
-     "Бұл уақытқа немесе мезгілге қатысты."),
-
-    # ── Білім & Мектеп ───────────────────────────────────────────
-    ({"мектеп","сынып","сабақ","кітап","дәптер","қалам","тақта","мұғалім",
-      "оқушы","студент","университет","ғылым","білім","зерттеу","тәжірибе",
-      "гимназия","лицей","колледж","академия","зертхана","кітапхана",
-      "мұражай","галерея","аудитория","емтихан","диплом","аттестат",
-      "сертификат","реферат","диссертация","конспект","семинар","дәріс"},
-     "Бұл білім немесе мектепке қатысты."),
-
-    # ── Кәсіп & Жұмыс ────────────────────────────────────────────
-    ({"жұмыс","еңбек","кәсіп","дәрігер","ұстаз","жазушы","ақын","суретші",
-      "сатушы","бақташы","егінші","малшы","балықшы","аңшы","ұста","тігінші",
-      "асшы","инженер","заңгер","экономист","бухгалтер","менеджер",
-      "архитектор","дизайнер","программист","журналист","режиссер","актер",
-      "хирург","терапевт","шаштараз","электрик","сантехник","жүргізуші",
-      "аудармашы","тілмаш","редактор","диктор"},
-     "Бұл кәсіп немесе мамандыққа қатысты."),
-
-    # ── Қоғам & Мемлекет ─────────────────────────────────────────
-    ({"мемлекет","халық","ұлт","отан","тарих","мәдениет","заң","құқық",
-      "бостандық","бірлік","тәуелсіздік","бейбітшілік","соғыс","жеңіс",
-      "саясат","сайлау","үкімет","парламент","президент","конституция",
-      "армия","полиция","сот","депутат","прокурор","кодекс","жарғы"},
-     "Бұл қоғам немесе мемлекетке қатысты."),
-
-    # ── Дін & Дәстүр ─────────────────────────────────────────────
-    ({"дін","намаз","мешіт","той","мереке","дәстүр","салт","ырым","дұға",
-      "ораза","зекет","қажылық","жаназа","садақа","сенім","ғибадат",
-      "пайғамбар","аят","шешен"},
-     "Бұл дін немесе дәстүрге қатысты."),
-
-    # ── Материалдар ──────────────────────────────────────────────
-    ({"темір","алтын","күміс","мыс","тас","топырақ","құм","саз","ағаш",
-      "май","су","от","жалын","түтін","күл","мұз","бу","болат","алюминий",
-      "мырыш","қорғасын","платина","шойын","шыны","пластик","резеңке","мата"},
-     "Бұл материал немесе заттық нәрсе."),
-
-    # ── Көлік ────────────────────────────────────────────────────
-    ({"жол","көше","машина","пойыз","ұшақ","кеме","велосипед","автобус",
-      "трамвай","метро","такси","мотоцикл","арба","троллейбус","маршрутка",
-      "трактор","комбайн","вертолет","зымыран","баржа","паром","яхта"},
-     "Бұл көлік немесе жолсапарға қатысты."),
-
-    # ── Технология & IT ──────────────────────────────────────────
-    ({"телефон","компьютер","планшет","экран","интернет","бағдарлама",
-      "сайт","код","алгоритм","деректер","принтер","сканер","монитор",
-      "пернетақта","камера","микрофон","динамик","зарядтағыш","кабель",
-      "робот","дрон","сервер","желі","қосымша"},
-     "Бұл технология немесе IT-ге қатысты."),
-
-    # ── Қаржы & Экономика ────────────────────────────────────────
-    ({"ақша","банк","несие","депозит","пайыз","бюджет","нарық","сауда",
-      "тауар","баға","жалақы","табыс","шығын","пайда","салық","инвестиция",
-      "акция","облигация","биржа","валюта","қор","салым","шот"},
-     "Бұл қаржы немесе экономикаға қатысты."),
-
-    # ── Спорт ────────────────────────────────────────────────────
-    ({"спорт","футбол","баскетбол","волейбол","теннис","бокс","күрес",
-      "жүзу","жарыс","чемпионат","жеңімпаз","жүлде","медаль","стадион",
-      "алаң","команда","тренер","турнир","финал","рекорд","кубок"},
-     "Бұл спортқа қатысты."),
-
-    # ── Медицина ─────────────────────────────────────────────────
-    ({"аурухана","дәрі","операция","дәріхана","рецепт","диагноз","емдеу",
-      "вакцина","қан","талдау","температура","қысым","жарақат","сынық",
-      "жара","дерт","індет","эпидемия","терапия","хирургия","медбике"},
-     "Бұл медицина немесе денсаулыққа қатысты."),
-
-    # ── Өнер & Мәдениет ──────────────────────────────────────────
-    ({"өнер","сурет","мүсін","кино","театр","музыка","би","өлең","жыр",
-      "дастан","роман","повесть","әңгіме","пьеса","сценарий","палитра",
-      "мозаика","графика","домбыра","қобыз","сыбызғы","дабыл","ән","әнші"},
-     "Бұл өнер немесе мәдениетке қатысты."),
-
-    # ── Абстрактілі ──────────────────────────────────────────────
-    ({"өмір","өлім","туу","тіршілік","теңдік","шындық","өтірік","жақсылық",
-      "жамандық","әділет","мән","мақсат","тағдыр","жазмыш","ерік",
-      "рас","жалған","ақиқат","адалдық","парыз","міндет","мінез","қасиет"},
-     "Бұл абстрактілі немесе философиялық ұғым."),
-]
-
-def _get_category_hint(word: str) -> str:
-    for word_set, hint in _CATEGORIES:
-        if word in word_set:
-            return hint
-    return "Бұл күнделікті өмірде жиі кездесетін сөз."
-
-
-@app.get("/api/similar/{game_id}", tags=["game"])
-async def get_similar_words(game_id: int):
-    """Returns top 200 most similar words to the secret word. Only useful after winning."""
-    if not engine.is_loaded():
-        raise HTTPException(503, detail="Engine not ready.")
-    secret = game_id_to_word(game_id)
-    if not engine.word_exists(secret):
-        raise HTTPException(500, detail="Secret word not in vocabulary.")
+def _similar_payload(secret: str, word: str):
+    # The list reveals the answer, so it is only given to someone who found it.
+    if normalize_word(word) != secret:
+        raise HTTPException(403, detail="Solve the game first.")
     similar = engine.get_top_similar(secret, topn=200)
     return {
         "secret": secret,
-        "similar": [
-            {"word": w, "rank": i + 2, "score": round(score, 4)}
-            for i, (w, score) in enumerate(similar)
-        ]
+        "similar": [{"word": w, "rank": i + 2, "score": round(s, 4)}
+                    for i, (w, s) in enumerate(similar)],
     }
 
 
-@app.get("/api/similar/custom/{custom_token}", tags=["game"])
-async def get_custom_similar(custom_token: str):
-    """Returns top 200 similar words for a custom game."""
-    if not engine.is_loaded():
-        raise HTTPException(503, detail="Engine not ready.")
-    secret = custom_games.get(custom_token)
-    if not secret:
-        raise HTTPException(404, detail="Custom game not found.")
-    if not engine.word_exists(secret):
-        raise HTTPException(500, detail="Secret word not in vocabulary.")
-    similar = engine.get_top_similar(secret, topn=200)
+@app.get("/api/similar/{game_id}")
+async def get_similar_words(game_id: int, word: str = ""):
+    require_engine()
+    return _similar_payload(resolve_secret(game_id, None), word)
+
+
+@app.get("/api/similar/custom/{custom_token}")
+async def get_custom_similar(custom_token: str, word: str = ""):
+    require_engine()
+    return _similar_payload(resolve_custom_token(custom_token), word)
+
+
+# Giving up: the client only asks for this when the player presses «Берілу».
+@app.get("/api/reveal/{game_id}")
+async def reveal_word(game_id: int):
+    require_engine()
+    return {"secret": resolve_secret(game_id, None)}
+
+
+@app.get("/api/reveal/custom/{custom_token}")
+async def reveal_custom_word(custom_token: str):
+    require_engine()
+    return {"secret": resolve_custom_token(custom_token)}
+
+
+@app.get("/api/stats")
+async def get_stats():
     return {
-        "secret": secret,
-        "similar": [
-            {"word": w, "rank": i + 2, "score": round(score, 4)}
-            for i, (w, score) in enumerate(similar)
-        ]
+        "vocab_size": len(engine.words),
+        "total_daily_words": len(playable_words),
+        "today_game_id": get_game_id_for_today(),
     }
 
 

@@ -51,7 +51,7 @@ function buildShareText(stats, history) {
     bars,
     "",
     `Жеңіс: ${stats.winRate}% | Орт: ${stats.avgGuesses} болжам`,
-    "zhasyrynsoz.vercel.app",
+    window.location.host,
   ].join("\n");
 }
 
@@ -105,13 +105,12 @@ export default function Stats({ onClose }) {
 
   const recent     = [...history].reverse().slice(0, 10);
   const shareText  = stats ? buildShareText(stats, history) : null;
-  const [copied, setCopied] = [false, () => {}];
 
   const handleShare = async () => {
     if (!shareText) return;
     if (navigator.share) {
       try {
-        await navigator.share({ title: "Жасырын Сөз", text: shareText, url: "https://zhasyrynsoz.vercel.app" });
+        await navigator.share({ title: "Жасырын Сөз", text: shareText, url: window.location.origin });
         return;
       } catch {}
     }
@@ -137,7 +136,7 @@ export default function Stats({ onClose }) {
 
   const handleShareTelegram = () => {
     if (!shareText) return;
-    const url = `https://t.me/share/url?url=https://zhasyrynsoz.vercel.app&text=${encodeURIComponent(shareText)}`;
+    const url = `https://t.me/share/url?url=${encodeURIComponent(window.location.origin)}&text=${encodeURIComponent(shareText)}`;
     window.open(url, "_blank");
   };
 

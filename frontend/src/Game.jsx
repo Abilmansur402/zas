@@ -1,172 +1,140 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   fetchDailyGame, fetchRandomGame, createCustomGame,
-  submitGuess, fetchHint, fetchSimilarWords, APIError,
+  submitGuess, fetchHint, fetchSimilarWords, fetchReveal, APIError,
 } from "./api";
 import { saveGameToHistory } from "./Stats";
+import { loadDailyState, saveDailyState } from "./lib/storage";
+import {
+  readCustomTokenFromUrl, setCustomTokenInUrl, customGameLink, shareOrCopy, buildResultText,
+} from "./lib/share";
+import GuessList from "./components/GuessList";
+import HintsPanel, { MAX_HINTS, MAX_CLOSE_WORD, countRegularHints } from "./components/HintsPanel";
+import ResultPanel from "./components/ResultPanel";
+import CustomForm from "./components/CustomForm";
 
-// ── LocalStorage ──────────────────────────────────────────────
-const STORAGE_KEY = "zhasyrynsoz_v2";
+const EMPTY_GAME = { guesses: [], won: false, gaveUp: false, secret: null, hints: {} };
 
-function loadState(gameId) {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const p = JSON.parse(raw);
-    if (p.gameId !== gameId) return null;
-    return p;
-  } catch { return null; }
-}
-
-function saveState(gameId, guesses, won) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ gameId, guesses, won }));
-  } catch {}
-}
-
-// ── Helpers ───────────────────────────────────────────────────
-function rankLabel(rank) {
-  return rank === 1 ? "1" : rank.toLocaleString();
-}
-
-function barWidth(rank) {
-  if (rank === 1) return 100;
-  const maxRank = 200000;
-  const pct = (1 - Math.log10(Math.min(rank, maxRank)) / Math.log10(maxRank)) * 100;
-  return Math.max(2, Math.round(pct * 10) / 10);
-}
-
-function barClass(color) {
-  return { winner: "bar-winner", hot: "bar-green", warm: "bar-orange", cold: "bar-pink" }[color] || "bar-pink";
-}
-
-// ── GuessItem ─────────────────────────────────────────────────
-function GuessItem({ guess, rank, color, isLatest }) {
-  return (
-    <div className={`guess-row ${isLatest ? "guess-latest" : ""}`}>
-      <span className={`guess-word-label ${barClass(color)}-text`}>{guess}</span>
-      <div className="guess-bar-track">
-        <div className={`guess-bar-fill ${barClass(color)}`} style={{ width: `${barWidth(rank)}%` }} />
-      </div>
-      <span className="guess-bar-rank">{rankLabel(rank)}</span>
-    </div>
-  );
-}
-
-// ── Hint config ───────────────────────────────────────────────
-const MAX_HINTS       = 5;   // max for non-close_word hints
-const MAX_CLOSE_WORD  = 10;  // close_word can be used up to 10 times
-
-const HINTS = [
-  { type: "category",   icon: "◈", label: "Санат",     sublabel: "Қандай топ?",   color: "#a78bfa" },
-  { type: "letter",     icon: "А", label: "1-ші әріп", sublabel: "Басталуы",      color: "#34d399" },
-  { type: "length",     icon: "⟷", label: "Ұзындық",   sublabel: "Нешe әріп?",    color: "#60a5fa" },
-  { type: "far_word",   icon: "○", label: "Алыс сөз",  sublabel: "~200–300 орын", color: "#f87171" },
-  { type: "mid_word",   icon: "◎", label: "Орта сөз",  sublabel: "~50–80 орын",   color: "#fb923c" },
-  { type: "close_word", icon: "●", label: "Жақын сөз", sublabel: "~20–30 орын",   color: "#4ade80" },
-];
-
-// ── Main Game ─────────────────────────────────────────────────
 export default function Game() {
-  const [gameId, setGameId]               = useState(null);
-  const [customToken, setCustomToken]     = useState(null);
-  const [gameMode, setGameMode]           = useState("daily");
-  const [guesses, setGuesses]             = useState([]);
-  const [won, setWon]                     = useState(false);
-  const [similarWords, setSimilarWords]   = useState([]);
+  const [gameId, setGameId]           = useState(null);
+  const [customToken, setCustomToken] = useState(null);
+  const [gameMode, setGameMode]       = useState("daily");
+  const [game, setGame]               = useState(EMPTY_GAME);
+  const [similarWords, setSimilarWords]     = useState([]);
   const [loadingSimilar, setLoadingSimilar] = useState(false);
-  const [input, setInput]                 = useState("");
-  const [loading, setLoading]             = useState(false);
-  const [error, setError]                 = useState("");
+  const [input, setInput]             = useState("");
+  const [loading, setLoading]         = useState(false);
+  const [initFailed, setInitFailed]   = useState(false);
+  const [error, setError]             = useState("");
+  const [shareNote, setShareNote]     = useState("");
   const [showCustomForm, setShowCustomForm] = useState(false);
-  const [customInput, setCustomInput]     = useState("");
-  const [customLoading, setCustomLoading] = useState(false);
-  const [customError, setCustomError]     = useState("");
-  const [sortByRank, setSortByRank]       = useState(false);
-  const [latestGuess, setLatestGuess]     = useState(null);
-  const [hintStates, setHintStates]       = useState({});
-  const [showHints, setShowHints]         = useState(false);
+  const [showHints, setShowHints]     = useState(false);
+  const [sortByRank, setSortByRank]   = useState(true);
+  const [latestGuess, setLatestGuess] = useState(null);
+  const [dupGuess, setDupGuess]       = useState(null);
   const inputRef = useRef(null);
+  const timers   = useRef({});
 
-  // ── Init ──────────────────────────────────────
-  useEffect(() => {
-    fetchDailyGame()
-      .then((d) => {
-        setGameId(d.game_id);
-        const saved = loadState(d.game_id);
-        if (saved) { setGuesses(saved.guesses); setWon(saved.won); }
-      })
-      .catch(() => showError("Серверге қосылу мүмкін болмады."));
+  const { guesses, won, gaveUp, hints: hintStates } = game;
+  const finished = won || gaveUp;
+  const solution = won ? guesses.find((g) => g.rank === 1)?.guess : game.secret;
+  const ready    = gameId !== null || !!customToken;
+
+  // ── Flash messages ────────────────────────────
+  const flash = useCallback((key, setter, msg, ms) => {
+    clearTimeout(timers.current[key]);
+    setter(msg);
+    timers.current[key] = setTimeout(() => setter(""), ms);
+  }, []);
+  const showError = useCallback((msg, ms = 3000) => flash("error", setError, msg, ms), [flash]);
+  const showNote  = useCallback((msg, ms = 2500) => flash("note", setShareNote, msg, ms), [flash]);
+
+  // ── Game setup ────────────────────────────────
+  const startGame = useCallback(({ mode, id = null, token = null, saved = null }) => {
+    setGameMode(mode); setGameId(id); setCustomToken(token);
+    setGame(saved ? { ...EMPTY_GAME, ...saved } : EMPTY_GAME);
+    setSimilarWords([]); setShowCustomForm(false); setInput(""); setError("");
+    setCustomTokenInUrl(token);
+    inputRef.current?.focus();
   }, []);
 
+  const startDaily = useCallback(async () => {
+    try {
+      const d = await fetchDailyGame();
+      setInitFailed(false);
+      startGame({ mode: "daily", id: d.game_id, saved: loadDailyState(d.game_id) });
+    } catch (err) {
+      setInitFailed(true);
+      showError(err.message || "Серверге қосылу мүмкін болмады.", 5000);
+    }
+  }, [startGame, showError]);
+
+  const startRandom = async () => {
+    try {
+      const d = await fetchRandomGame();
+      startGame({ mode: "random", id: d.game_id });
+    } catch (err) { showError(err.message); }
+  };
+
+  const handleCreateCustom = async (word) => {
+    const { custom_token } = await createCustomGame(word);  // errors are shown by the form
+    startGame({ mode: "custom", token: custom_token });
+    const how = await shareOrCopy(`Жасырын Сөз: мен бір сөз ойладым, тауып көр! ${customGameLink(custom_token)}`);
+    if (how === "copied") showNote("Сілтеме көшірілді — досыңызға жіберіңіз!", 4000);
+  };
+
   useEffect(() => {
-    if (gameId !== null && gameMode !== "custom") saveState(gameId, guesses, won);
-  }, [gameId, guesses, won, gameMode]);
+    const token = readCustomTokenFromUrl();
+    if (token) startGame({ mode: "custom", token });
+    else startDaily();
+  }, [startGame, startDaily]);
 
-  // ── Derived ───────────────────────────────────
-  const bestRank    = guesses.reduce((b, g) => (g.rank < b ? g.rank : b), Infinity);
-  const bestDisplay = guesses.length === 0 ? "—" : bestRank === 1 ? "★" : bestRank.toLocaleString();
+  useEffect(() => {
+    if (gameMode === "daily" && gameId !== null) saveDailyState({ gameId, ...game });
+  }, [gameMode, gameId, game]);
 
-  const displayGuesses = sortByRank
-    ? [...guesses].sort((a, b) => a.rank - b.rank)
-    : [...guesses].reverse();
+  // Closest words are shown once the game is over (also after a reload).
+  useEffect(() => {
+    if (!finished || !solution) return;
+    let cancelled = false;
+    setLoadingSimilar(true);
+    fetchSimilarWords(gameId, customToken, solution)
+      .then((data) => { if (!cancelled) setSimilarWords(data.similar || []); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoadingSimilar(false); });
+    return () => { cancelled = true; };
+  }, [finished, solution, gameId, customToken]);
 
-  // Count non-close_word hints used
-  const regularHintsUsed = HINTS
-    .filter((h) => h.type !== "close_word")
-    .filter((h) => !!hintStates[h.type]?.result)
-    .length;
-
-  // ── Error helper ──────────────────────────────
-  function showError(msg, ms = 3000) {
-    setError(msg);
-    setTimeout(() => setError(""), ms);
-  }
+  const recordResult = (didWin, secretWord, guessCount) => saveGameToHistory({
+    gameId, customToken, mode: gameMode, won: didWin, guessCount, secretWord, ts: Date.now(),
+  });
 
   // ── Guess ─────────────────────────────────────
-  const handleSubmit = useCallback(async () => {
+  const handleSubmit = async () => {
     const word = input.trim().toLowerCase();
-    if (!word || loading || won) return;
-    if (guesses.find((g) => g.guess === word)) {
-      showError("Бұл сөзді бұрын болжадыңыз.");
+    if (!word || loading || finished || !ready) return;
+    if (guesses.some((g) => g.guess === word)) {
       setInput("");
+      setDupGuess(word);
+      setTimeout(() => setDupGuess(null), 1200);
+      showError("Бұл сөзді бұрын болжадыңыз.");
       return;
     }
     setLoading(true);
     setError("");
     try {
-      const result = await submitGuess(gameId, word, customToken);
-      const entry = {
-        guess:         result.guess,
-        rank:          result.rank,
-        color:         result.color,
-        closeness_pct: result.closeness_pct,
-      };
-      setGuesses((prev) => [...prev, entry]);
-      setLatestGuess(result.guess);
+      const r = await submitGuess(gameId, word, customToken);
+      const entry = { guess: r.guess, rank: r.rank, color: r.color, closeness_pct: r.closeness_pct };
+      setGame((g) => ({ ...g, guesses: [...g.guesses, entry], won: r.found }));
+      setLatestGuess(r.guess);
       setTimeout(() => setLatestGuess(null), 1500);
       setInput("");
-      if (result.found) {
-        setWon(true);
-        saveGameToHistory({
-          gameId:      gameId,
-          customToken: customToken || null,
-          mode:        gameMode,
-          won:         true,
-          guessCount:  guesses.length + 1,
-          secretWord:  result.guess,
-          ts:          Date.now(),
-        });
-        // Load top-60 similar words
-        setLoadingSimilar(true);
-        fetchSimilarWords(gameId, customToken).then((data) => {
-          setSimilarWords(data.similar || []);
-          setLoadingSimilar(false);
-        }).catch(() => setLoadingSimilar(false));
-      }
+      if (r.found) recordResult(true, r.guess, guesses.length + 1);
     } catch (err) {
       if (err instanceof APIError && err.code === "WORD_NOT_FOUND") {
         showError(`«${word}» — сөздікте жоқ.`);
+      } else if (err instanceof APIError && err.status === 404 && customToken) {
+        showError("Бұл сілтеме жарамсыз. Күнделікті ойынға ауысыңыз.", 5000);
       } else {
         showError(err.message || "Қате орын алды.");
       }
@@ -174,316 +142,139 @@ export default function Game() {
       setLoading(false);
       inputRef.current?.focus();
     }
-  }, [input, loading, won, guesses, gameId, customToken, gameMode]);
-
-  // ── Mode switches ─────────────────────────────
-  const switchToDaily = async () => {
-    const d = await fetchDailyGame();
-    setGameId(d.game_id); setCustomToken(null); setGameMode("daily");
-    setGuesses([]); setWon(false); setHintStates({}); setShowCustomForm(false);
-    setSimilarWords([]); setLoadingSimilar(false);
   };
 
-  const switchToRandom = async () => {
-    const d = await fetchRandomGame();
-    setGameId(d.game_id); setCustomToken(null); setGameMode("random");
-    setGuesses([]); setWon(false); setHintStates({}); setShowCustomForm(false);
-    setSimilarWords([]); setLoadingSimilar(false);
-  };
-
-  const handleCreateCustom = async () => {
-    const word = customInput.trim().toLowerCase();
-    if (!word) return;
-    setCustomLoading(true);
-    setCustomError("");
+  // ── Give up ───────────────────────────────────
+  const handleGiveUp = async () => {
+    if (finished || !ready || !window.confirm("Берілесіз бе? Жасырын сөз ашылады.")) return;
     try {
-      const result = await createCustomGame(word);
-      setCustomToken(result.custom_token); setGameId(null); setGameMode("custom");
-      setGuesses([]); setWon(false); setHintStates({});
-      setCustomInput(""); setShowCustomForm(false);
-    } catch (err) {
-      setCustomError(err.message || "Сөз қабылданмады.");
-    } finally {
-      setCustomLoading(false);
-    }
+      const { secret } = await fetchReveal(gameId, customToken);
+      setGame((g) => ({ ...g, gaveUp: true, secret }));
+      recordResult(false, secret, guesses.length);
+    } catch (err) { showError(err.message); }
   };
 
   // ── Hints ─────────────────────────────────────
-  const handleHint = useCallback(async (type) => {
-    if (hintStates[type]?.loading) return;
+  const setHint = (type, patch) =>
+    setGame((g) => ({ ...g, hints: { ...g.hints, [type]: { ...g.hints[type], ...patch } } }));
 
-    // ── close_word: up to MAX_CLOSE_WORD times, each gives new word ──
-    if (type === "close_word") {
-      const prev  = hintStates[type] || { results: [], count: 0 };
-      if (prev.count >= MAX_CLOSE_WORD) return;
-      setHintStates((s) => ({ ...s, [type]: { ...prev, loading: true } }));
-      try {
-        const result = await fetchHint(gameId, type, customToken, prev.count);
-        setHintStates((s) => ({
-          ...s,
-          [type]: {
-            loading: false,
-            count:   prev.count + 1,
-            results: [...(prev.results || []), result.hint],
-            result:  result.hint,
-          },
-        }));
-      } catch {
-        setHintStates((s) => ({ ...s, [type]: { ...prev, loading: false } }));
-      }
-      return;
-    }
+  const handleHint = async (type) => {
+    const prev = hintStates[type] || {};
+    if (prev.loading || finished) return;
+    const isClose = type === "close_word";
+    if (isClose ? (prev.count || 0) >= MAX_CLOSE_WORD
+                : prev.result || countRegularHints(hintStates) >= MAX_HINTS) return;
 
-    // ── All other hints: one-time, limited to MAX_HINTS total ──
-    if (hintStates[type]?.result) return;
-    if (regularHintsUsed >= MAX_HINTS) return;
-    setHintStates((s) => ({ ...s, [type]: { loading: true } }));
+    setHint(type, { loading: true });
     try {
-      const result = await fetchHint(gameId, type, customToken);
-      setHintStates((s) => ({ ...s, [type]: { loading: false, result: result.hint } }));
-    } catch {
-      setHintStates((s) => ({ ...s, [type]: { loading: false } }));
+      const { hint } = await fetchHint(gameId, type, customToken, isClose ? prev.count || 0 : 0);
+      setHint(type, isClose
+        ? { loading: false, count: (prev.count || 0) + 1, results: [...(prev.results || []), hint] }
+        : { loading: false, result: hint });
+    } catch (err) {
+      setHint(type, { loading: false });
+      showError(err.message || "Кеңес алынбады.");
     }
-  }, [hintStates, regularHintsUsed, gameId, customToken]);
+  };
+
+  const hintsUsed = countRegularHints(hintStates) + (hintStates.close_word?.count || 0);
+
+  const handleShareResult = async () => {
+    const how = await shareOrCopy(buildResultText({ gameMode, gameId, guesses, hintsUsed, gaveUp }));
+    if (how === "copied") showNote("Нәтиже көшірілді!");
+  };
+
+  const handleCopyCustomLink = async () => {
+    const how = await shareOrCopy(customGameLink(customToken));
+    if (how === "copied") showNote("Сілтеме көшірілді!");
+  };
 
   // ── Render ────────────────────────────────────
+  const bestRank = guesses.reduce((b, g) => Math.min(b, g.rank), Infinity);
+
   return (
     <div className="game-wrap">
-
-      {/* Mode selector */}
       <div className="mode-bar">
-        <button className={`mode-btn ${gameMode === "daily"  ? "mode-active" : ""}`} onClick={switchToDaily}>Күнделікті</button>
-        <button className={`mode-btn ${gameMode === "random" ? "mode-active" : ""}`} onClick={switchToRandom}>Кездейсоқ 🎲</button>
+        <button className={`mode-btn ${gameMode === "daily"  ? "mode-active" : ""}`} onClick={startDaily}>Күнделікті</button>
+        <button className={`mode-btn ${gameMode === "random" ? "mode-active" : ""}`} onClick={startRandom}>Кездейсоқ 🎲</button>
         <button className={`mode-btn ${gameMode === "custom" ? "mode-active" : ""}`} onClick={() => setShowCustomForm((v) => !v)}>Өз сөзім ✏️</button>
       </div>
 
-      {/* Custom word form */}
-      {showCustomForm && (
-        <div className="custom-form">
-          <p className="custom-title">Жасырын сөзді енгізіңіз</p>
-          <div className="input-row">
-            <input
-              className="guess-input"
-              value={customInput}
-              onChange={(e) => setCustomInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleCreateCustom()}
-              placeholder="Мысалы: үй, жылқы, арман..."
-              autoComplete="off" spellCheck={false}
-            />
-            <button className="btn-submit" onClick={handleCreateCustom} disabled={customLoading || !customInput.trim()}>
-              {customLoading ? "…" : "Бастау"}
-            </button>
-          </div>
-          {customError && <div className="error-msg">{customError}</div>}
-          <p className="custom-hint">Сөзді енгізіп, досыңызбен ойнаңыз!</p>
+      {showCustomForm && <CustomForm onCreate={handleCreateCustom} />}
+
+      {gameMode === "custom" && customToken && !finished && (
+        <div className="custom-active">
+          <span>Досыңыздың сөзі</span>
+          <button className="ctrl-btn" onClick={handleCopyCustomLink}>🔗 Сілтеме</button>
         </div>
       )}
 
-      {/* Top bar */}
+      {shareNote && <div className="share-note">{shareNote}</div>}
+
+      {initFailed && !ready && (
+        <div className="error-msg retry-row">
+          <span>Серверге қосылу мүмкін болмады.</span>
+          <button className="ctrl-btn" onClick={startDaily}>↻ Қайталау</button>
+        </div>
+      )}
+
       <div className="top-bar">
         <span className="top-guesses">
           БОЛЖАМДАР: <strong>{guesses.length}</strong>
-          {guesses.length > 0 && <span className="top-best"> · Жақын: <strong>{bestDisplay}</strong></span>}
+          {guesses.length > 0 && (
+            <span className="top-best"> · Жақын: <strong>{bestRank === 1 ? "★" : bestRank.toLocaleString()}</strong></span>
+          )}
         </span>
         <div className="top-controls">
           {guesses.length > 1 && (
-            <button className={`ctrl-btn ${sortByRank ? "ctrl-active" : ""}`} onClick={() => setSortByRank((v) => !v)}>
-              {sortByRank ? "↕ Уақыт" : "↕ Нөмір"}
+            <button className="ctrl-btn" onClick={() => setSortByRank((v) => !v)}>
+              {sortByRank ? "↕ Нөмір" : "↕ Уақыт"}
             </button>
           )}
           <button className={`ctrl-btn ${showHints ? "ctrl-active" : ""}`} onClick={() => setShowHints((v) => !v)}>
             Кеңес {showHints ? "▲" : "▼"}
           </button>
+          {!finished && guesses.length > 0 && (
+            <button className="ctrl-btn ctrl-danger" onClick={handleGiveUp}>🏳️ Берілу</button>
+          )}
         </div>
       </div>
 
-      {/* Input */}
-      <div className="input-row">
-        <input
-          ref={inputRef}
-          className="guess-input"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
-          placeholder="Сөз жазыңыз..."
-          disabled={loading || won || (gameId === null && !customToken)}
-          autoComplete="off" autoCorrect="off" spellCheck={false}
-        />
-        <button
-          className="btn-submit"
-          onClick={handleSubmit}
-          disabled={loading || won || !input.trim() || (gameId === null && !customToken)}
-        >
-          {loading ? "…" : "Болжау"}
-        </button>
-      </div>
-
-      {error && <div className="error-msg">{error}</div>}
-
-      {/* Hints panel */}
-      {showHints && (
-        <div className="hints-panel">
-          <div className="hints-used-label">
-            <span>Кеңестер</span>
-            <span className={regularHintsUsed >= MAX_HINTS ? "hints-limit-reached" : ""}>
-              {regularHintsUsed}/{MAX_HINTS} пайдаланылды
-            </span>
-          </div>
-
-          <div className="hints-grid">
-            {HINTS.map((h) => {
-              const state = hintStates[h.type] || {};
-              const busy  = !!state.loading;
-
-              /* ── close_word — special multi-use card ── */
-              if (h.type === "close_word") {
-                const count   = state.count || 0;
-                const results = state.results || [];
-                const maxed   = count >= MAX_CLOSE_WORD;
-                return (
-                  <div
-                    key={h.type}
-                    className={`hint-card hint-card-wide ${busy ? "hint-busy" : ""} ${maxed ? "hint-locked" : ""}`}
-                    style={{ "--hc": h.color }}
-                    onClick={() => !busy && !maxed && handleHint(h.type)}
-                  >
-                    <span className="hc-icon" style={{ color: count > 0 ? h.color : maxed ? "#2d3748" : "#4a5568" }}>
-                      {maxed ? "🔒" : h.icon}
-                    </span>
-                    <div className="hc-body" style={{ flex: 1 }}>
-                      <div className="hc-top-row">
-                        <span className="hc-label">{h.label}</span>
-                        <span className={`hc-counter ${maxed ? "hc-counter-maxed" : ""}`}>
-                          {count}/{MAX_CLOSE_WORD}
-                        </span>
-                      </div>
-                      {results.length === 0 ? (
-                        <span className="hc-sub">{busy ? "…" : h.sublabel}</span>
-                      ) : (
-                        <div className="close-words-list">
-                          {results.map((r, i) => (
-                            <span key={i} className="close-word-badge">
-                              {r.match(/«(.+)»/)?.[1] || r}
-                            </span>
-                          ))}
-                          {!maxed && !busy && (
-                            <span className="close-word-more">+ тағы</span>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              }
-
-              /* ── regular one-time hints ── */
-              const used   = !!state.result;
-              const locked = !used && regularHintsUsed >= MAX_HINTS;
-              return (
-                <div
-                  key={h.type}
-                  className={`hint-card ${used ? "hint-used" : ""} ${busy ? "hint-busy" : ""} ${locked ? "hint-locked" : ""}`}
-                  onClick={() => !used && !busy && !locked && handleHint(h.type)}
-                  style={{ "--hc": h.color }}
-                >
-                  <span className="hc-icon" style={{ color: used ? h.color : locked ? "#2d3748" : "#4a5568" }}>
-                    {locked ? "🔒" : h.icon}
-                  </span>
-                  <div className="hc-body">
-                    <span className="hc-label" style={{ color: locked ? "var(--text-dim)" : undefined }}>{h.label}</span>
-                    <span className="hc-sub">{busy ? "…" : used ? state.result : locked ? "Лимит" : h.sublabel}</span>
-                  </div>
-                  {used && <span className="hc-tick" style={{ color: h.color }}>✓</span>}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* Win banner */}
-      {won && (
-        <div className="win-banner">
-          <span className="win-icon">🏆</span>
-          <div>
-            <div className="win-title">Керемет!</div>
-            <div className="win-sub">{guesses.length} болжаммен таптыңыз!</div>
-          </div>
-          <button className="btn-new-game" onClick={gameMode === "random" ? switchToRandom : switchToDaily}>
-            Жаңа ойын
+      {!finished && (
+        <div className="input-row">
+          <input
+            ref={inputRef}
+            className="guess-input"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
+            placeholder="Сөз жазыңыз..."
+            disabled={loading || !ready}
+            autoFocus autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+          />
+          <button className="btn-submit" onClick={handleSubmit} disabled={loading || !input.trim() || !ready}>
+            {loading ? "…" : "Болжау"}
           </button>
         </div>
       )}
 
-      {/* Top-60 similar words after winning */}
-      {won && (
-        <div className="similar-section">
-          <div className="similar-header">
-            <span className="similar-title">Жасырын сөзге жақын топ-60</span>
-            {loadingSimilar && <span className="similar-loading">жүктелуде…</span>}
-          </div>
-          {similarWords.length > 0 && (
-            <div className="similar-list">
-              {similarWords
-                .filter((item) => {
-                  const w = item.word;
-                  // Filter out obvious inflected forms:
-                  // words ending in common Kazakh suffixes where a shorter root exists
-                  const inflectionEndings = [
-                    "лардың","лердің","дардың","дердің","тардың","тердің",
-                    "ларды","лерді","дарды","дерді","тарды","терді",
-                    "ларда","лерде","дарда","дерде","тарда","терде",
-                    "лардан","лерден","дардан","дерден","тардан","терден",
-                    "ларға","лерге","дарға","дерге","тарға","терге",
-                    "лармен","лермен","дармен","дермен","тармен","термен",
-                    "лары","лері","лар","лер","дар","дер","тар","тер",
-                    "ның","нің","дың","дің","тың","тің",
-                    "ды","ді","ты","ті","ны","ні",
-                    "да","де","та","те","нда","нде",
-                    "дан","ден","тан","тен","нан","нен",
-                    "ға","ге","қа","ке","на","не",
-                    "мен","бен","пен",
-                    "сы","сі","ым","ім","ың","іңіз","ыңыз",
-                  ].sort((a,b) => b.length - a.length);
-                  for (const end of inflectionEndings) {
-                    if (w.endsWith(end) && w.length - end.length >= 2) {
-                      return false; // likely inflected
-                    }
-                  }
-                  // Must be at least 2 chars, no digits, no Latin
-                  if (w.length < 2) return false;
-                  if (/[a-zA-Z0-9]/.test(w)) return false;
-                  return true;
-                })
-                .slice(0, 60)
-                .map((item, displayIdx) => {
-                  const color = displayIdx < 8  ? "sim-gold"
-                              : displayIdx < 20 ? "sim-green"
-                              : displayIdx < 40 ? "sim-yellow"
-                              : "sim-gray";
-                  const wasGuessed = guesses.find((g) => g.guess === item.word);
-                  return (
-                    <div key={item.word} className={`similar-item ${color} ${wasGuessed ? "sim-guessed" : ""}`}>
-                      <span className="sim-rank">#{displayIdx + 2}</span>
-                      <span className="sim-word">{item.word}</span>
-                      {wasGuessed && <span className="sim-tag">✓</span>}
-                    </div>
-                  );
-                })}
-            </div>
-          )}
-        </div>
+      {error && <div className="error-msg">{error}</div>}
+
+      {showHints && <HintsPanel hintStates={hintStates} onUse={handleHint} disabled={finished || !ready} />}
+
+      {finished && (
+        <ResultPanel
+          won={won}
+          secret={solution}
+          guesses={guesses}
+          similarWords={similarWords}
+          loadingSimilar={loadingSimilar}
+          onShare={handleShareResult}
+          onNewGame={startRandom}
+        />
       )}
 
-      {/* Guess bars */}
-      {guesses.length > 0 && (
-        <div className="guess-list">
-          {displayGuesses.map((g) => (
-            <GuessItem key={g.guess} {...g} isLatest={g.guess === latestGuess} />
-          ))}
-        </div>
-      )}
-
+      <GuessList guesses={guesses} sortByRank={sortByRank} latestGuess={latestGuess} highlight={dupGuess} />
     </div>
   );
 }

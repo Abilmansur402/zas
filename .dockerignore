@@ -1,0 +1,8 @@
+**/node_modules
+**/__pycache__
+**/.env
+frontend/dist
+data
+paper
+*.docx
+.git
